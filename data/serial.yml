@@ -1733,6 +1733,13 @@ commands:
       type: int
 
     # telemetry stuff
+    send-rpm-windowed-telemetry:
+      read: -1
+      write: 63
+      id: [26, 0]
+      bytes: 8
+      type: array
+
     send-rpm-telemetry:
       read: -1
       write: 63

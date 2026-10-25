@@ -48,6 +48,11 @@ enable OutGauge in the game and send telemetry to **127.0.0.1:4444**
 enabled to update the LEDs after closing the window. Stop any separate
 `moza-rev` instance before using this feature.
 
+Modern wheels such as the TSW use their telemetry LED command, including
+when attached to an R3/R5 base. Their RPM bar uses a Normal timing profile
+and learns the highest RPM observed, so rev the engine once to calibrate
+it. Older wheels continue to use the timings configured in **Wheel Old**.
+
 ### Ideas
 - Telemetry ingestion through REST API/WebSockets
 - Cammus support

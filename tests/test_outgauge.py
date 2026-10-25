@@ -50,6 +50,13 @@ class RecordingSerialHandler:
 
 
 class PacketTests(unittest.TestCase):
+    def test_switch_to_truck_profile_discards_previous_es_redline(self):
+        scale = RpmScale()
+        scale.bitmask(OutGaugePacket(b"beam", 7000), RpmSettings(mode=0, percent=EARLY))
+        truck = RpmSettings(mode=0, percent=NORMAL, redline_floor=0)
+        self.assertEqual(scale.bitmask(OutGaugePacket(b"beam", 2500), truck), 0x3ff)
+        self.assertEqual(scale.bitmask(OutGaugePacket(b"beam", 1800), truck), 0)
+
     def test_classic_and_beamng_packets_use_little_endian_rpm_at_offset_16(self):
         for size in (92, 96):
             with self.subTest(size=size):
@@ -121,6 +128,99 @@ class ConnectionFixture(unittest.TestCase):
 
 
 class SharedConnectionTests(ConnectionFixture):
+    def test_outgauge_does_not_write_general_rpm_or_button_idle_settings(self):
+        self.receive_wheel_setting("telemetry-mode", 1)
+        idle_settings = {
+            "idle-mode": 1, "idle-timeout": 10, "idle-speed": 2500,
+            "idle-color": [0, 255, 255], "telemetry-idle-effect": 2,
+            "telemetry-idle-interval": (2 << 16) + 2500,
+            "buttons-idle-effect": 1, "buttons-idle-interval": (1 << 16) + 2500,
+        }
+        for name, value in idle_settings.items():
+            self.cm.set_setting(value, f"wheel-{name}")
+        before = len(self.handler.messages)
+        self.cm.send_rpm_telemetry(0x3ff)
+        self.cm.send_rpm_telemetry(0)
+        commands = self.cm.get_command_data()["wheel"]
+        for message in self.handler.messages[before:]:
+            for name in idle_settings:
+                command_id = bytes(commands[name]["id"])
+                self.assertNotEqual(message[4:4+len(command_id)], command_id)
+
+    def test_tsw_on_r5_uses_modern_capability_instead_of_base_model(self):
+        self.receive_wheel_setting("telemetry-mode", 1)
+        self.cm.send_rpm_telemetry(0x3ff)
+        self.assertEqual(self.handler.messages[-1],
+            bytes.fromhex("7e 0a 3f 17 1a 00 ff 03 00 00 ff 03 00 00 09"))
+        self.assertEqual(self.handler.messages[0][2:6], bytes.fromhex("3f 17 1c 00"))
+        settings = self.cm.get_rpm_settings()
+        self.assertEqual(settings.percent, NORMAL)
+        self.assertEqual(settings.redline_floor, 0)
+
+    def test_modern_telemetry_palette_tracks_configured_colors(self):
+        self.receive_wheel_setting("telemetry-mode", 1)
+        for i in range(10):
+            self.receive_wheel_setting(f"rpm-color{i+1}", [10+i, 20, 30])
+        self.cm.send_rpm_telemetry(1)
+        self.assertEqual(len(self.handler.messages), 4)  # mode, two palettes, mask
+        self.assertEqual(self.handler.messages[1][4:10], bytes([25, 0, 0, 10, 20, 30]))
+        self.assertEqual(self.handler.messages[2][4:10], bytes([25, 0, 5, 15, 20, 30]))
+        self.cm.send_rpm_telemetry(2)
+        self.assertEqual(len(self.handler.messages), 5)
+        self.cm.set_setting([255, 0, 0], "wheel-rpm-color1")
+        self.cm.send_rpm_telemetry(3)
+        self.assertEqual(self.handler.messages[-3][6:10], bytes([0, 255, 0, 0]))
+
+    def test_palette_replaces_cyan_after_repeated_edits_and_static_rewrites(self):
+        self.receive_wheel_setting("telemetry-mode", 1)
+        for i in range(10):
+            self.receive_wheel_setting(f"rpm-color{i+1}", [0, 255, 255])
+        with patch("boxflat.connection_manager.time.monotonic", return_value=10):
+            self.cm.send_rpm_telemetry(0x3ff)
+            for rgb in ([255, 0, 0], [0, 0, 255], [0, 0, 255], [0, 0, 0]):
+                self.cm.set_setting(rgb, "wheel-rpm-color1")
+                static_index = len(self.handler.messages) - 1
+                self.cm.send_rpm_telemetry(0x3ff)
+                self.assertEqual(len(self.handler.messages) - static_index, 4)
+                self.assertEqual(self.handler.messages[static_index][4:8], bytes([31, 0, 255, 0]))
+                self.assertEqual(self.handler.messages[-3][4:10], bytes([25, 0, 0, *rgb]))
+                self.assertEqual(self.handler.messages[-1][4:6], bytes([26, 0]))
+
+    def test_keepalive_resends_palette_before_windowed_mask(self):
+        self.receive_wheel_setting("telemetry-mode", 1)
+        for i in range(10):
+            self.receive_wheel_setting(f"rpm-color{i+1}", [255, 0, 0])
+        with patch("boxflat.connection_manager.time.monotonic", return_value=10):
+            self.cm.send_rpm_telemetry(0x3ff)
+        initial = list(self.handler.messages)
+        with patch("boxflat.connection_manager.time.monotonic", return_value=10.1):
+            self.cm.send_rpm_telemetry(0x3ff)
+        self.assertEqual(len(self.handler.messages), len(initial) + 1)
+        with patch("boxflat.connection_manager.time.monotonic", return_value=10.6):
+            self.cm.send_rpm_telemetry(0x3ff)
+        self.assertEqual(self.handler.messages[-3:], initial[-3:])
+
+    def test_existing_color_framing_is_preserved_and_live_palette_escapes_rgb(self):
+        self.receive_wheel_setting("telemetry-mode", 1)
+        for i in range(10):
+            self.receive_wheel_setting(f"rpm-color{i+1}", [0, 255, 255])
+        self.cm.set_setting([126, 1, 2], "wheel-rpm-color1")
+        self.assertEqual(self.handler.messages[-1],
+            bytes.fromhex("7e 07 3f 17 1f 00 ff 00 7e 01 02 87"))
+        self.cm.send_rpm_telemetry(0x3ff)
+        self.assertEqual(self.handler.messages[-3][6:11], bytes([0, 126, 126, 1, 2]))
+
+    def test_switching_modern_to_old_wheel_restores_configured_timings(self):
+        self.receive_wheel_setting("telemetry-mode", 1)
+        self.cm._rpm_modern_connected(-1)
+        self.receive_wheel_setting("rpm-value1", 5400)
+        self.receive_wheel_setting("rpm-mode", 0)
+        self.receive_wheel_setting("rpm-timings", list(EARLY))
+        self.assertEqual(self.cm.get_rpm_settings().percent, EARLY)
+        self.cm.send_rpm_telemetry(0x3ff)
+        self.assertEqual(self.handler.messages[-1],
+            bytes.fromhex("7e 06 41 13 fd de 00 00 03 ff c2"))
+
     def test_timing_cache_uses_device_readback_and_ui_or_preset_writes(self):
         self.assertIsNone(self.cm.get_rpm_settings().mode)
         self.receive_wheel_setting("rpm-mode", 0)
@@ -157,7 +257,7 @@ class SharedConnectionTests(ConnectionFixture):
         self.base.path = "usb-Gudsen_MOZA_R9_Base_test"
         self.cm.send_rpm_telemetry(0x3ff)
         self.assertEqual(self.handler.messages[-1],
-            bytes.fromhex("7e 04 3f 17 1a 00 ff 03 01"))
+            bytes.fromhex("7e 0a 3f 17 1a 00 ff 03 00 00 ff 03 00 00 09"))
         self.cm._serial_data["device-ids"]["wheel"] = 21
         self.cm.send_rpm_telemetry(0)
         self.assertEqual(self.handler.messages[-1][3], 21)
@@ -219,6 +319,17 @@ class UdpListenerTests(ConnectionFixture):
 
     def send(self, rpm, size=96):
         self.sender.sendto(packet_bytes(rpm, size), ("127.0.0.1", self.listener.port))
+
+    def test_tsw_truck_rpm_on_r5_without_legacy_timing_settings(self):
+        self.cm._rpm_settings = RpmSettings()
+        self.receive_wheel_setting("telemetry-mode", 1)
+        self.listener.set_enabled(True)
+        full = bytes.fromhex("7e 0a 3f 17 1a 00 ff 03 00 00 ff 03 00 00 09")
+        self.send(2500)
+        self.assertTrue(self.handler.wait_for(lambda messages: messages[-1] == full))
+        self.send(1800)  # below Normal's 75% of the observed 2500 RPM peak
+        clear = bytes.fromhex("7e 0a 3f 17 1a 00 00 00 00 00 ff 03 00 00 07")
+        self.assertTrue(self.handler.wait_for(lambda messages: messages[-1] == clear))
 
     def test_early_late_and_custom_timings_change_wire_mask_at_constant_rpm(self):
         self.listener.set_enabled(True)

@@ -20,7 +20,8 @@ DEFAULT_PORT = 4444
 INITIAL_REDLINE = 7000
 LED_COUNT = 10
 MAX_UPDATE_RATE = 30
-HEARTBEAT_INTERVAL = 1.0
+# Modern firmware falls back to its stored/idle colors after about 1 s.
+HEARTBEAT_INTERVAL = 0.5
 IDLE_TIMEOUT = 2.0
 
 logger = logging.getLogger(__name__)
@@ -49,20 +50,24 @@ class RpmSettings:
     mode: int | None = None
     percent: tuple[int, ...] | None = None
     rpm: tuple[int | None, ...] = (None,) * LED_COUNT
+    redline_floor: int = INITIAL_REDLINE
 
 
 class RpmScale:
     def __init__(self):
         self._car = None
-        self._redline = INITIAL_REDLINE
+        self._redline = 0
+        self._redline_floor = None
 
     def bitmask(self, packet: OutGaugePacket, settings: RpmSettings) -> int | None:
-        if packet.car != self._car:
+        if packet.car != self._car or settings.redline_floor != self._redline_floor:
             self._car = packet.car
-            self._redline = INITIAL_REDLINE
+            self._redline = 0
+            self._redline_floor = settings.redline_floor
         self._redline = max(self._redline, packet.rpm)
+        redline = max(1, settings.redline_floor, self._redline)
         if settings.mode == 0 and settings.percent is not None:
-            thresholds = tuple(value * self._redline / 100 for value in settings.percent)
+            thresholds = tuple(value * redline / 100 for value in settings.percent)
         elif settings.mode == 1 and all(value is not None for value in settings.rpm):
             thresholds = settings.rpm
         else:

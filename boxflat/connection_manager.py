@@ -12,7 +12,7 @@ from queue import SimpleQueue
 from .serial_handler import SerialHandler
 import re
 from dataclasses import replace
-from .outgauge import RpmSettings
+from .outgauge import RpmSettings, HEARTBEAT_INTERVAL
 
 CM_RETRY_COUNT=1
 
@@ -67,6 +67,10 @@ class MozaConnectionManager(EventDispatcher):
         self._rpm_lock = Lock()
         self._rpm_target = None
         self._rpm_settings = RpmSettings()
+        self._rpm_protocol = None
+        self._rpm_colors = [None] * 10
+        self._rpm_color_target = None
+        self._rpm_colors_sent_at = 0.0
         self._exclusive_access = Event()
         self._exclusive_access.set()
 
@@ -102,8 +106,9 @@ class MozaConnectionManager(EventDispatcher):
 
         # Keep the same values used by the UI, including device readback at
         # startup and presets applied while the window is in the background.
-        self._rpm_setting_names = ("wheel-rpm-mode", "wheel-rpm-timings",
-                                  *(f"wheel-rpm-value{i+1}" for i in range(10)))
+        self._rpm_setting_names = ("wheel-rpm-mode", "wheel-rpm-timings", "wheel-telemetry-mode",
+                                  *(f"wheel-rpm-value{i+1}" for i in range(10)),
+                                  *(f"wheel-rpm-color{i+1}" for i in range(10)))
         for name in self._rpm_setting_names:
             self.subscribe(name, self._cache_rpm_setting, name)
 
@@ -113,6 +118,7 @@ class MozaConnectionManager(EventDispatcher):
         self._connected_subscriptions: dict[str, SubscriptionList] = {}
         self._connected_thread = None
         self._connected_lock = Lock()
+        self.subscribe_connected("wheel-telemetry-mode", self._rpm_modern_connected)
 
         self._message_start= int(self._serial_data["message-start"])
         self._magic_value = int(self._serial_data["magic-value"])
@@ -164,6 +170,9 @@ class MozaConnectionManager(EventDispatcher):
         if ("base" in new_devices) != ("base" in old_devices):
             with self._rpm_lock:
                 self._rpm_settings = RpmSettings()
+                self._rpm_protocol = None
+                self._rpm_colors = [None] * 10
+                self._rpm_color_target = None
 
         for name in new_devices:
             if name in old_devices:
@@ -292,6 +301,7 @@ class MozaConnectionManager(EventDispatcher):
     def send_rpm_telemetry(self, bitmask: int) -> bool:
         """Queue a 10-LED RPM bar on the existing wheelbase connection.
 
+        Modern telemetry capability takes precedence over the base model.
         R3/R5 ES wheels require the base's legacy telemetry command. Do
         not route that command to the wheel ID: its firmware can lock up.
         Wire format and model detection follow moza-rev/src/moza.rs.
@@ -304,10 +314,13 @@ class MozaConnectionManager(EventDispatcher):
         if base is None:
             return False
 
-        legacy = bool(re.search(r"_r[35]_", base.path.lower()))
+        with self._rpm_lock:
+            protocol = self._rpm_protocol
+        legacy = protocol == "legacy" or (protocol is None and
+            bool(re.search(r"_r[35]_", base.path.lower())))
         device = "base" if legacy else "wheel"
         device_id = self.get_device_id(device)
-        target = (base.serial_handler, device_id)
+        target = (base.serial_handler, device_id, legacy)
         bitmask = max(0, min(int(bitmask), 0x3ff))
 
         def queue_command(name, value):
@@ -324,24 +337,72 @@ class MozaConnectionManager(EventDispatcher):
                 queue_command("es-rpm-indicator-mode" if legacy else "telemetry-mode", 1)
                 self._rpm_target = target
 
-            queue_command("send-rpm-telemetry",
-                          bitmask if legacy else list(bitmask.to_bytes(2, "little")))
+            # Modern firmware uses a separate palette for telemetry. Copy
+            # the colors shown by the Wheel panel, as its telemetry test does.
+            colors = tuple(self._rpm_colors)
+            color_target = (target, colors)
+            now = time.monotonic()
+            if not legacy and all(color is not None for color in colors):
+                if (self._rpm_color_target != color_target or
+                        now - self._rpm_colors_sent_at >= HEARTBEAT_INTERVAL):
+                    payload = [value for index, color in enumerate(colors)
+                               for value in (index, *color)]
+                    queue_command("telemetry-rpm-colors", payload[:20])
+                    queue_command("telemetry-rpm-colors", payload[20:])
+                    self._rpm_color_target = color_target
+                    self._rpm_colors_sent_at = now
+
+            # The window claims the entire bar, including currently dark
+            # LEDs. A bare active mask can leave stale firmware LED state.
+            # See giantorth/AZOM docs/protocol/leds/color-commands.md.
+            queue_command("send-rpm-telemetry" if legacy else "send-rpm-windowed-telemetry",
+                          bitmask if legacy else list(
+                              bitmask.to_bytes(4, "little") + (0x3ff).to_bytes(4, "little")))
         return True
 
 
     def reset_rpm_telemetry(self):
         with self._rpm_lock:
             self._rpm_target = None
+            self._rpm_color_target = None
 
 
     def get_rpm_settings(self) -> RpmSettings:
         with self._rpm_lock:
+            if self._rpm_protocol == "modern":
+                # The modern Wheel panel has no hardware timing table. Use
+                # a Normal bar and learn the observed peak, including truck
+                # engines whose maximum RPM is far below 7000.
+                return RpmSettings(mode=0, percent=(75, 79, 82, 85, 87, 88, 89, 90, 92, 94),
+                                   redline_floor=0)
             return self._rpm_settings
 
 
-    def _cache_rpm_setting(self, value, name):
+    def _rpm_modern_connected(self, value):
         with self._rpm_lock:
-            if name == "wheel-rpm-mode" and value in (0, 1):
+            if value in (0, 1, 2):
+                self._rpm_protocol = "modern"
+            elif self._rpm_protocol == "modern":
+                self._rpm_protocol = None
+                self._rpm_settings = RpmSettings()
+                self._rpm_colors = [None] * 10
+                self._rpm_color_target = None
+
+
+    def _cache_rpm_setting(self, value, name, written=False):
+        with self._rpm_lock:
+            if name == "wheel-telemetry-mode" and value in (0, 1, 2):
+                self._rpm_protocol = "modern"
+            elif name.startswith("wheel-rpm-color"):
+                index = name.removeprefix("wheel-rpm-color")
+                if index.isdecimal() and 1 <= int(index) <= 10:
+                    if isinstance(value, (list, tuple)) and len(value) == 3:
+                        self._rpm_colors[int(index) - 1] = tuple(value)
+                        if written:
+                            # Static writes repaint the live buffer even if
+                            # the RGB is unchanged. Reapply the live palette.
+                            self._rpm_color_target = None
+            elif name == "wheel-rpm-mode" and value in (0, 1):
                 self._rpm_settings = replace(self._rpm_settings, mode=value)
             elif name == "wheel-rpm-timings" and isinstance(value, (list, tuple)):
                 if len(value) == 10 and all(isinstance(v, int) and 0 <= v <= 100 for v in value):
@@ -350,6 +411,8 @@ class MozaConnectionManager(EventDispatcher):
                 index = name.removeprefix("wheel-rpm-value")
                 if index.isdecimal() and 1 <= int(index) <= 10:
                     if isinstance(value, int) and 0 <= value <= 65535:
+                        if self._rpm_protocol != "modern":
+                            self._rpm_protocol = "legacy"
                         values = list(self._rpm_settings.rpm)
                         values[int(index) - 1] = value
                         self._rpm_settings = replace(self._rpm_settings, rpm=tuple(values))
@@ -405,11 +468,14 @@ class MozaConnectionManager(EventDispatcher):
             return
 
         command.set_payload(value)
+        # Queue the static setting before publishing it to the live palette.
+        # Otherwise the OutGauge thread can send the new palette first and
+        # the following static write clobbers it after it was cached as sent.
+        self._handle_command_v2(command, rw)
         name = f"{device_name}-{command_name}"
         if rw == MOZA_COMMAND_WRITE and name in self._rpm_setting_names:
             self._cache_rpm_setting(MozaCommand.value_from_data(
-                command.payload, command.type, command.payload_length), name)
-        self._handle_command_v2(command, rw)
+                command.payload, command.type, command.payload_length), name, written=True)
 
 
     def _split_name(self, command_name: str) -> tuple[str, str]:
