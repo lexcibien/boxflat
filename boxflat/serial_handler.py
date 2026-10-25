@@ -18,6 +18,7 @@ class SerialHandler(SimpleEventDispatcher):
         self._read_queue = Queue()
         self._text_read_queue = Queue()
         self._write_queue = Queue()
+        self._write_flushed = Event()
 
         self._serial_available = Event()
         self._shutdown = Event()
@@ -40,6 +41,13 @@ class SerialHandler(SimpleEventDispatcher):
         if message is None:
             return
         self._write_queue.put(message)
+
+
+    def flush(self, timeout=0.5) -> bool:
+        """Wait for queued writes before the serial process is stopped."""
+        self._write_flushed.clear()
+        self._write_queue.put(None)
+        return self._write_flushed.wait(timeout)
 
 
     def _notification_handler(self):
@@ -120,6 +128,10 @@ class SerialHandler(SimpleEventDispatcher):
 
             # print(f"{self._device_name} writing: {data.hex(":")}")
             try:
+                if data is None:
+                    self._serial.flush()
+                    self._write_flushed.set()
+                    continue
                 self._serial.write(data)
             except:
                 self._serial_loader()

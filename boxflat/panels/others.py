@@ -27,12 +27,14 @@ class OtherSettings(SettingsPanel):
         version: str,
         application: Adw.Application,
         data_path: str,
-        description_handler=None
+        description_handler=None,
+        outgauge=None
     ):
         self._version = version
         self._settings = settings
         self._brake_row = None
         self._data_path = data_path
+        self._outgauge = outgauge
 
         super().__init__("Other", button_callback,
             connection_manager=cm,
@@ -105,6 +107,9 @@ class OtherSettings(SettingsPanel):
         fix_row.subscribe(self._hid_handler.set_detection_fix_enabled)
         fix_row.set_value(self._settings.read_setting("moza-detection-fix-enabled"))
 
+        if self._outgauge is not None:
+            self._prepare_outgauge()
+
         # Autostart and background stuff
         hidden = BoxflatSwitchRow("Start hidden")
         hidden.set_value(self._settings.read_setting("autostart-hidden") or 0)
@@ -148,6 +153,53 @@ class OtherSettings(SettingsPanel):
                 "default": "Off",
                 "recommended": "Enable only when running on startup with background mode active."
             })
+
+
+    def _prepare_outgauge(self):
+        self.add_preferences_group("OutGauge telemetry")
+        self._outgauge_row = BoxflatSwitchRow("Enable OutGauge RPM LEDs",
+            "BeamNG.drive / Live for Speed · 10 RPM LEDs")
+        self._outgauge_row.disable_cooldown()
+        self._add_row(self._outgauge_row,
+            description={
+                "description": "Receive OutGauge telemetry and drive the wheel's RPM LEDs using Boxflat's device connection.",
+                "default": "Off",
+                "recommended": "Enable OutGauge in the game, send to 127.0.0.1 and the port below, and enable Run in the background."
+            })
+        self._outgauge_row.subscribe(self._set_outgauge_enabled)
+
+        port = Adw.SpinRow(title="OutGauge UDP port", adjustment=Gtk.Adjustment(
+            lower=1, upper=65535, step_increment=1, page_increment=100,
+            value=self._outgauge.port))
+        self._add_row(port,
+            description={
+                "description": "UDP port for OutGauge telemetry. Use the same port in the game.",
+                "range": "1–65535",
+                "default": "4444"
+            })
+        port.connect("notify::value", lambda row, *_: self._set_outgauge_port(int(row.get_value())))
+
+        self._outgauge_status = BoxflatLabelRow("OutGauge status", value=self._outgauge.status)
+        self._add_row(self._outgauge_status,
+            description={"description": "Listener address or the reason OutGauge could not start."})
+        self._outgauge.subscribe(self._outgauge_status.set_label)
+        self._outgauge_row.set_value(self._settings.read_setting("outgauge-enabled") or 0, mute=False)
+
+
+    def _set_outgauge_enabled(self, enabled):
+        if not self._outgauge.set_enabled(enabled):
+            self.show_toast(self._outgauge.status, timeout=5)
+            self._outgauge_row.set_value(0)
+            enabled = False
+        self._settings.write_setting(int(bool(enabled)), "outgauge-enabled")
+
+
+    def _set_outgauge_port(self, port):
+        self._settings.write_setting(port, "outgauge-port")
+        if not self._outgauge.set_port(port):
+            self.show_toast(self._outgauge.status, timeout=5)
+            self._outgauge_row.set_value(0)
+            self._settings.write_setting(0, "outgauge-enabled")
 
 
     def get_brake_valibration_enabled(self) -> int:

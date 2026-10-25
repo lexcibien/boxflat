@@ -62,6 +62,8 @@ class MozaConnectionManager(EventDispatcher):
 
         self._serial_devices: dict[str, MozaSerialDevice] = {}
         self._devices_lock = Lock()
+        self._rpm_lock = Lock()
+        self._rpm_target = None
         self._exclusive_access = Event()
         self._exclusive_access.set()
 
@@ -111,6 +113,11 @@ class MozaConnectionManager(EventDispatcher):
     def shutdown(self, *rest):
         self._dispatch("shutdown")
         self._shutdown.set()
+        self.refresh_cont(False)
+        with self._devices_lock:
+            devices = list(self._serial_devices.values())
+        for device in devices:
+            device.serial_handler.stop()
 
 
     def device_discovery(self, *args):
@@ -266,6 +273,58 @@ class MozaConnectionManager(EventDispatcher):
             return
         # print(f"Redirect {device_type} to hub")
         return self._serial_devices["hub"].serial_handler
+
+
+    def send_rpm_telemetry(self, bitmask: int) -> bool:
+        """Queue a 10-LED RPM bar on the existing wheelbase connection.
+
+        R3/R5 ES wheels require the base's legacy telemetry command. Do
+        not route that command to the wheel ID: its firmware can lock up.
+        Wire format and model detection follow moza-rev/src/moza.rs.
+        """
+        if self._dry_run or self._shutdown.is_set() or not self._exclusive_access.is_set():
+            return False
+
+        with self._devices_lock:
+            base = self._serial_devices.get("base")
+        if base is None:
+            return False
+
+        legacy = bool(re.search(r"_r[35]_", base.path.lower()))
+        device = "base" if legacy else "wheel"
+        device_id = self.get_device_id(device)
+        target = (base.serial_handler, device_id)
+        bitmask = max(0, min(int(bitmask), 0x3ff))
+
+        def queue_command(name, value):
+            command = MozaCommand()
+            command.set_data_from_name(name, self._serial_data["commands"], device)
+            command.device_id = device_id
+            command.set_payload(value)
+            message = command.prepare_message(
+                self._message_start, MOZA_COMMAND_WRITE, self._magic_value, escape=True)
+            base.serial_handler.write_bytes(message)
+
+        with self._rpm_lock:
+            if target != self._rpm_target:
+                queue_command("es-rpm-indicator-mode" if legacy else "telemetry-mode", 1)
+                self._rpm_target = target
+
+            queue_command("send-rpm-telemetry",
+                          bitmask if legacy else list(bitmask.to_bytes(2, "little")))
+        return True
+
+
+    def reset_rpm_telemetry(self):
+        with self._rpm_lock:
+            self._rpm_target = None
+
+
+    def flush_rpm_telemetry(self):
+        with self._rpm_lock:
+            target = self._rpm_target
+        if target is not None:
+            target[0].flush()
 
 
     def _receive_data(self, data: bytes, device_name: str):

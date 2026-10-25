@@ -205,7 +205,7 @@ class MozaCommand():
 
 
     def prepare_message(self, start_value: int,
-                        rw: int, magic_value: int) -> bytes:
+                        rw: int, magic_value: int, *, escape=False) -> bytes:
 
         ret = bytearray()
         ret.append(start_value)
@@ -219,6 +219,14 @@ class MozaCommand():
         ret.append(self._device_id)
         ret.extend(self.id_bytes)
         ret.extend(self._payload)
-        ret.append(self.checksum(ret, magic_value))
+
+        # Telemetry uses the same framing as settings, with doubled start
+        # bytes in the body. The checksum includes those extra wire bytes;
+        # the length still describes the unescaped command and payload.
+        marker = bytes([start_value])
+        if escape:
+            ret = ret[:2] + ret[2:].replace(marker, marker * 2)
+        checksum = bytes([self.checksum(ret, magic_value)])
+        ret.extend(checksum.replace(marker, marker * 2) if escape else checksum)
 
         return bytes(ret)

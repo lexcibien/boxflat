@@ -37,6 +37,17 @@ Boxflat for Moza Racing. Control your Moza gear settings... and more!
 | Presets         | 100%          | |
 | Generic devices | Detection fix | |
 
+### OutGauge RPM LEDs (BeamNG.drive / Live for Speed)
+
+Drive your wheel's RPM LEDs from BeamNG.drive or Live for Speed telemetry,
+with support ported from `francisdb/moza-rev` and timings configured in Boxflat.
+
+Enable **Other → OutGauge telemetry → Enable OutGauge RPM LEDs**, then
+enable OutGauge in the game and send telemetry to **127.0.0.1:4444**
+(or the UDP port selected in Boxflat). Keep **Run in the background**
+enabled to update the LEDs after closing the window. Stop any separate
+`moza-rev` instance before using this feature.
+
 ### Ideas
 - Telemetry ingestion through REST API/WebSockets
 - Cammus support

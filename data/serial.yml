@@ -823,6 +823,21 @@ commands:
       bytes: 1
       type: int
 
+    # ES/ESX wheel telemetry is addressed to the base on R3/R5.
+    es-rpm-indicator-mode:
+      read: -1
+      write: 64
+      id: [4]
+      bytes: 1
+      type: int
+
+    send-rpm-telemetry:
+      read: -1
+      write: 65
+      id: [253, 222]
+      bytes: 4
+      type: int
+
 # Dashboard
   dash:
     rpm-timings:

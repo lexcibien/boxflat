@@ -11,6 +11,7 @@ from boxflat.connection_manager import MozaConnectionManager
 from boxflat.hid_handler import HidHandler
 from boxflat.settings_handler import SettingsHandler
 from boxflat.description_handler import DescriptionHandler
+from boxflat.outgauge import OutGaugeListener, DEFAULT_PORT
 from threading import Thread, Event
 
 from gi.repository.Gio import Notification, NotificationPriority
@@ -157,6 +158,10 @@ class MyApp(Adw.Application):
         self._held = Event()
 
         self._cm = MozaConnectionManager(os.path.join(data_path, "serial.yml"), dry_run)
+        self._outgauge = OutGaugeListener(self._cm,
+            port=self._settings.read_setting("outgauge-port") or DEFAULT_PORT,
+            dry_run=dry_run)
+        self.connect("shutdown", self._shutdown)
         self._description_handler = DescriptionHandler(data_path)
         self._cm.subscribe("hid-device-connected", self._hid_handler.add_device)
         self._cm.subscribe("hid-device-disconnected", self._hid_handler.remove_device)
@@ -317,7 +322,8 @@ class MyApp(Adw.Application):
         self._panels["Generic Devices"] = GenericSettings(self.switch_panel, self._settings, self._description_handler)
 
         self._panels["Other"] = OtherSettings(
-            self.switch_panel, self._cm, self._hid_handler, self._settings, self._version, self, self._data_path, self._description_handler)
+            self.switch_panel, self._cm, self._hid_handler, self._settings, self._version, self, self._data_path, self._description_handler,
+            outgauge=self._outgauge)
 
         self._panels["Other"].subscribe("brake-calibration-enabled", self._panels["Pedals"].set_brake_calibration_active)
         self._panels["Pedals"].set_brake_calibration_active(self._panels["Other"].get_brake_valibration_enabled())
@@ -338,6 +344,7 @@ class MyApp(Adw.Application):
 
 
     def _shutdown(self, *_) -> None:
+        self._outgauge.stop()
         for panel in self._panels.values():
             panel.shutdown()
 
