@@ -1,12 +1,12 @@
 """OutGauge RPM LEDs, using Boxflat's existing serial writer.
 
-Packet offsets and the adaptive RPM scale are ported from moza-rev's
-outgauge.rs, listeners/outgauge.rs and app.rs. No extra device is opened.
+Packet offsets and adaptive redline tracking follow moza-rev. LED masks
+use the wheel's configured timings. No extra device is opened.
 """
 
 from dataclasses import dataclass
 import logging
-from math import floor, isfinite
+from math import isfinite
 from multiprocessing.util import register_after_fork
 import socket
 from struct import unpack_from
@@ -18,7 +18,6 @@ from boxflat.subscription import SimpleEventDispatcher
 
 DEFAULT_PORT = 4444
 INITIAL_REDLINE = 7000
-ASSUMED_IDLE = 800
 LED_COUNT = 10
 MAX_UPDATE_RATE = 30
 HEARTBEAT_INTERVAL = 1.0
@@ -43,21 +42,36 @@ class OutGaugePacket:
         return cls(car=data[4:8], rpm=rpm)
 
 
+@dataclass(frozen=True)
+class RpmSettings:
+    # None means the setting has not yet been read from or written to the
+    # wheel. Wait for actual settings instead of inventing LED thresholds.
+    mode: int | None = None
+    percent: tuple[int, ...] | None = None
+    rpm: tuple[int | None, ...] = (None,) * LED_COUNT
+
+
 class RpmScale:
     def __init__(self):
         self._car = None
         self._redline = INITIAL_REDLINE
 
-    def bitmask(self, packet: OutGaugePacket) -> int | None:
+    def bitmask(self, packet: OutGaugePacket, settings: RpmSettings) -> int | None:
         if packet.car != self._car:
             self._car = packet.car
             self._redline = INITIAL_REDLINE
         self._redline = max(self._redline, packet.rpm)
-        fraction = max(0.0, min(1.0,
-            (packet.rpm - ASSUMED_IDLE) / (self._redline - ASSUMED_IDLE)))
-        # Rust f32::round rounds positive halves up, unlike Python round.
-        lit = floor(fraction * LED_COUNT + 0.5)
-        return (1 << lit) - 1
+        if settings.mode == 0 and settings.percent is not None:
+            thresholds = tuple(value * self._redline / 100 for value in settings.percent)
+        elif settings.mode == 1 and all(value is not None for value in settings.rpm):
+            thresholds = settings.rpm
+        else:
+            return None
+        if packet.rpm <= 0:
+            return 0
+        # Evaluate each LED independently, preserving custom timing orders.
+        return sum(1 << index for index, threshold in enumerate(thresholds)
+                   if packet.rpm >= threshold)
 
 
 class OutGaugeListener(SimpleEventDispatcher):
@@ -154,6 +168,7 @@ class OutGaugeListener(SimpleEventDispatcher):
         last_send_at = 0.0
         last_mask = None
         pending_mask = 0
+        latest_packet = None
         drove_leds = False
         try:
             while not self._stop.is_set():
@@ -175,7 +190,14 @@ class OutGaugeListener(SimpleEventDispatcher):
                 packet = OutGaugePacket.from_bytes(data) if data is not None else None
                 if packet is not None:
                     last_packet_at = now
-                    pending_mask = scale.bitmask(packet)
+                    latest_packet = packet
+
+                if last_packet_at is not None:
+                    # Recompute even at constant RPM so edits to a timing
+                    # slider or RPM mode take effect without restarting UDP.
+                    pending_mask = scale.bitmask(latest_packet, self._cm.get_rpm_settings())
+                    if pending_mask is None:
+                        continue
 
                 if last_packet_at is None and not drove_leds:
                     continue

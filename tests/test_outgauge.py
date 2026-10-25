@@ -10,11 +10,14 @@ from unittest.mock import patch
 
 from boxflat.connection_manager import MozaConnectionManager, MozaSerialDevice
 from boxflat.moza_command import MozaCommand, MOZA_COMMAND_WRITE
-from boxflat.outgauge import OutGaugeListener, OutGaugePacket, RpmScale
+from boxflat.outgauge import OutGaugeListener, OutGaugePacket, RpmScale, RpmSettings
 from boxflat.serial_handler import SerialHandler
 
 
 SERIAL_DATA = Path(__file__).resolve().parents[1] / "data" / "serial.yml"
+EARLY = (65, 69, 72, 75, 78, 80, 83, 85, 88, 91)
+NORMAL = (75, 79, 82, 85, 87, 88, 89, 90, 92, 94)
+LATE = (80, 83, 86, 89, 91, 92, 93, 94, 96, 97)
 
 
 def packet_bytes(rpm, size=96, car=b"beam"):
@@ -37,7 +40,7 @@ class RecordingSerialHandler:
 
     def wait_for(self, predicate, timeout=2):
         with self.changed:
-            return self.changed.wait_for(lambda: predicate(self.messages), timeout)
+            return self.changed.wait_for(lambda: bool(self.messages) and predicate(self.messages), timeout)
 
     def stop(self):
         self.stopped = True
@@ -62,13 +65,40 @@ class PacketTests(unittest.TestCase):
             with self.subTest(rpm=rpm):
                 self.assertIsNone(OutGaugePacket.from_bytes(packet_bytes(rpm)))
 
+    def test_percent_presets_use_each_configured_led_threshold(self):
+        for timings in (EARLY, NORMAL, LATE):
+            scale = RpmScale()
+            settings = RpmSettings(mode=0, percent=timings)
+            for index, percent in enumerate(timings):
+                threshold = percent * 7000 / 100
+                with self.subTest(timings=timings, led=index+1):
+                    self.assertEqual(scale.bitmask(OutGaugePacket(b"beam", threshold - 1), settings),
+                                     (1 << index) - 1)
+                    self.assertEqual(scale.bitmask(OutGaugePacket(b"beam", threshold), settings),
+                                     (1 << (index + 1)) - 1)
+
     def test_scale_tracks_redline_resets_for_new_car_and_handles_engine_off(self):
         scale = RpmScale()
-        for rpm, expected in ((0, 0), (800, 0), (3900, 0x1f), (7000, 0x3ff)):
-            self.assertEqual(scale.bitmask(OutGaugePacket(b"beam", rpm)), expected)
-        self.assertEqual(scale.bitmask(OutGaugePacket(b"beam", 10000)), 0x3ff)
-        self.assertEqual(scale.bitmask(OutGaugePacket(b"beam", 5400)), 0x1f)
-        self.assertEqual(scale.bitmask(OutGaugePacket(b"LFS\0", 3900)), 0x1f)
+        settings = RpmSettings(mode=0, percent=EARLY)
+        for rpm, expected in ((0, 0), (800, 0), (3900, 0), (5000, 0x3), (7000, 0x3ff)):
+            self.assertEqual(scale.bitmask(OutGaugePacket(b"beam", rpm), settings), expected)
+        self.assertEqual(scale.bitmask(OutGaugePacket(b"beam", 10000), settings), 0x3ff)
+        self.assertEqual(scale.bitmask(OutGaugePacket(b"beam", 7000), settings), 0x3)
+        self.assertEqual(scale.bitmask(OutGaugePacket(b"LFS\0", 7000), settings), 0x3ff)
+
+    def test_absolute_rpm_and_independent_custom_led_timings(self):
+        scale = RpmScale()
+        # LED2 precedes LED1; the configured order must survive mask creation.
+        settings = RpmSettings(mode=1, rpm=(6000, 3000, 4000, 5000, 7000, 7100, 7200, 7300, 7400, 7500))
+        self.assertEqual(scale.bitmask(OutGaugePacket(b"beam", 3000), settings), 0b10)
+        self.assertEqual(scale.bitmask(OutGaugePacket(b"beam", 6000), settings), 0xf)
+        self.assertEqual(scale.bitmask(OutGaugePacket(b"beam", 12000), settings), 0x3ff)
+        self.assertEqual(scale.bitmask(OutGaugePacket(b"beam", 3000), settings), 0b10)
+
+    def test_unknown_settings_do_not_fall_back_to_linear_bar(self):
+        scale = RpmScale()
+        self.assertIsNone(scale.bitmask(OutGaugePacket(b"beam", 7000), RpmSettings()))
+        self.assertIsNone(scale.bitmask(OutGaugePacket(b"beam", 7000), RpmSettings(mode=1)))
 
 
 class ConnectionFixture(unittest.TestCase):
@@ -78,11 +108,36 @@ class ConnectionFixture(unittest.TestCase):
         self.base = MozaSerialDevice("base", "usb-Gudsen_MOZA_R5_Base_test", self.handler)
         self.cm._serial_devices["base"] = self.base
 
+    def receive_wheel_setting(self, name, value):
+        command = MozaCommand()
+        command.set_data_from_name(name, self.cm.get_command_data(), "wheel")
+        command.set_payload(value)
+        # Responses contain the read group with bit 7 set and swapped ID nibbles.
+        self.cm._receive_data(bytes([command.read_group | 0x80, 0x71]) +
+                              command.id_bytes + command.payload + b"\0", "base")
+
     def tearDown(self):
         self.cm.shutdown()
 
 
 class SharedConnectionTests(ConnectionFixture):
+    def test_timing_cache_uses_device_readback_and_ui_or_preset_writes(self):
+        self.assertIsNone(self.cm.get_rpm_settings().mode)
+        self.receive_wheel_setting("rpm-mode", 0)
+        self.receive_wheel_setting("rpm-timings", list(LATE))
+        settings = self.cm.get_rpm_settings()
+        self.assertEqual(settings.mode, 0)
+        self.assertEqual(settings.percent, LATE)
+        self.cm.set_setting(list(EARLY), "wheel-rpm-timings")
+        self.assertEqual(self.cm.get_rpm_settings().percent, EARLY)
+        self.assertEqual(settings.percent, LATE)  # old snapshot remains immutable
+        self.cm.set_setting(1, "wheel-rpm-mode")
+        self.cm.set_setting(4500, "wheel-rpm-value1")
+        self.assertEqual(self.cm.get_rpm_settings().mode, 1)
+        self.assertEqual(self.cm.get_rpm_settings().rpm[0], 4500)
+        self.receive_wheel_setting("rpm-value2", 4800)
+        self.assertEqual(self.cm.get_rpm_settings().rpm[1], 4800)
+
     def test_legacy_frames_match_moza_rev_and_share_settings_writer(self):
         with patch("boxflat.connection_manager.SerialHandler") as new_handler:
             self.assertTrue(self.cm.send_rpm_telemetry(0x3ff))
@@ -152,6 +207,8 @@ class SharedConnectionTests(ConnectionFixture):
 class UdpListenerTests(ConnectionFixture):
     def setUp(self):
         super().setUp()
+        self.receive_wheel_setting("rpm-mode", 0)
+        self.receive_wheel_setting("rpm-timings", list(EARLY))
         self.listener = OutGaugeListener(self.cm, port=0)
         self.sender = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
@@ -162,6 +219,35 @@ class UdpListenerTests(ConnectionFixture):
 
     def send(self, rpm, size=96):
         self.sender.sendto(packet_bytes(rpm, size), ("127.0.0.1", self.listener.port))
+
+    def test_early_late_and_custom_timings_change_wire_mask_at_constant_rpm(self):
+        self.listener.set_enabled(True)
+        self.send(5000)
+        mask_frame = lambda mask: bytes([0, 0]) + mask.to_bytes(2, "big")
+        is_mask = lambda mask: lambda messages: (
+            len(messages[-1]) >= 10 and messages[-1][2] == 0x41 and
+            messages[-1][6:10] == mask_frame(mask))
+        self.assertTrue(self.handler.wait_for(is_mask(0x3)))  # Early: LEDs1–2
+        self.cm.set_setting(list(LATE), "wheel-rpm-timings")
+        self.assertTrue(self.handler.wait_for(is_mask(0)))  # Late: all below 80%
+        self.cm.set_setting([70] * 10, "wheel-rpm-timings")
+        self.assertTrue(self.handler.wait_for(is_mask(0x3ff)))  # custom: 4900 RPM
+        for i in range(10):
+            self.cm.set_setting(5100 + 100 * i, f"wheel-rpm-value{i+1}")
+        self.cm.set_setting(1, "wheel-rpm-mode")
+        self.assertTrue(self.handler.wait_for(is_mask(0)))
+        self.cm.set_setting(5000, "wheel-rpm-value1")
+        self.assertTrue(self.handler.wait_for(is_mask(1)))  # exact RPM, same packet
+
+    def test_listener_waits_for_actual_settings_and_uses_them_when_available(self):
+        self.cm._rpm_settings = RpmSettings()
+        self.listener.set_enabled(True)
+        self.send(5000)
+        self.assertFalse(self.handler.wait_for(lambda messages: True, timeout=0.1))
+        self.receive_wheel_setting("rpm-timings", list(EARLY))
+        self.receive_wheel_setting("rpm-mode", 0)
+        self.assertTrue(self.handler.wait_for(lambda messages:
+            messages[-1][6:10] == b"\0\0\0\x03"))
 
     def test_udp_drives_shared_writer_clears_off_and_on_stop(self):
         self.assertTrue(self.listener.set_enabled(True))

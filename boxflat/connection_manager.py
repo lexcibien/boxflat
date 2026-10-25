@@ -11,6 +11,8 @@ from .subscription import SubscriptionList, EventDispatcher, BlockingValue
 from queue import SimpleQueue
 from .serial_handler import SerialHandler
 import re
+from dataclasses import replace
+from .outgauge import RpmSettings
 
 CM_RETRY_COUNT=1
 
@@ -64,6 +66,7 @@ class MozaConnectionManager(EventDispatcher):
         self._devices_lock = Lock()
         self._rpm_lock = Lock()
         self._rpm_target = None
+        self._rpm_settings = RpmSettings()
         self._exclusive_access = Event()
         self._exclusive_access.set()
 
@@ -96,6 +99,13 @@ class MozaConnectionManager(EventDispatcher):
         self._register_events(*self._polling_list)
         self._register_events("device-connected", "hid-device-connected")
         self._register_events("device-disconnected", "hid-device-disconnected")
+
+        # Keep the same values used by the UI, including device readback at
+        # startup and presets applied while the window is in the background.
+        self._rpm_setting_names = ("wheel-rpm-mode", "wheel-rpm-timings",
+                                  *(f"wheel-rpm-value{i+1}" for i in range(10)))
+        for name in self._rpm_setting_names:
+            self.subscribe(name, self._cache_rpm_setting, name)
 
         self._serial_lock = Lock()
         self._refresh_cont = Event()
@@ -150,6 +160,10 @@ class MozaConnectionManager(EventDispatcher):
         old_devices = None
         with self._devices_lock:
             old_devices = self._serial_devices
+
+        if ("base" in new_devices) != ("base" in old_devices):
+            with self._rpm_lock:
+                self._rpm_settings = RpmSettings()
 
         for name in new_devices:
             if name in old_devices:
@@ -320,6 +334,27 @@ class MozaConnectionManager(EventDispatcher):
             self._rpm_target = None
 
 
+    def get_rpm_settings(self) -> RpmSettings:
+        with self._rpm_lock:
+            return self._rpm_settings
+
+
+    def _cache_rpm_setting(self, value, name):
+        with self._rpm_lock:
+            if name == "wheel-rpm-mode" and value in (0, 1):
+                self._rpm_settings = replace(self._rpm_settings, mode=value)
+            elif name == "wheel-rpm-timings" and isinstance(value, (list, tuple)):
+                if len(value) == 10 and all(isinstance(v, int) and 0 <= v <= 100 for v in value):
+                    self._rpm_settings = replace(self._rpm_settings, percent=tuple(value))
+            elif name.startswith("wheel-rpm-value"):
+                index = name.removeprefix("wheel-rpm-value")
+                if index.isdecimal() and 1 <= int(index) <= 10:
+                    if isinstance(value, int) and 0 <= value <= 65535:
+                        values = list(self._rpm_settings.rpm)
+                        values[int(index) - 1] = value
+                        self._rpm_settings = replace(self._rpm_settings, rpm=tuple(values))
+
+
     def flush_rpm_telemetry(self):
         with self._rpm_lock:
             target = self._rpm_target
@@ -370,6 +405,10 @@ class MozaConnectionManager(EventDispatcher):
             return
 
         command.set_payload(value)
+        name = f"{device_name}-{command_name}"
+        if rw == MOZA_COMMAND_WRITE and name in self._rpm_setting_names:
+            self._cache_rpm_setting(MozaCommand.value_from_data(
+                command.payload, command.type, command.payload_length), name)
         self._handle_command_v2(command, rw)
 
 
